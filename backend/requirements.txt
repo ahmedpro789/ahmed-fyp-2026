@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+pymongo
+python-dotenv
+bcrypt
+pyjwt
+anthropic
+apscheduler
+certifi
+requests
+beautifulsoup4
+lxml
+chromadb
+sentence-transformers
+numpy
+cloudinary

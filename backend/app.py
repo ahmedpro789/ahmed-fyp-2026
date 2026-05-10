@@ -4,8 +4,9 @@ import copy
 import asyncio
 import anthropic
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, status, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import List, Dict, Optional
@@ -24,9 +25,38 @@ import json
 import ipaddress
 import re
 import sys
+import uuid
 from urllib.parse import urlparse
 
 load_dotenv()
+
+CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
+CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
+CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
+PUBLIC_BACKEND_URL = os.getenv("PUBLIC_BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
+LOCAL_UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
+CLOUDINARY_CONFIGURED = bool(
+    CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET
+)
+if CLOUDINARY_CONFIGURED:
+    import cloudinary
+
+    cloudinary.config(
+        cloud_name=CLOUDINARY_CLOUD_NAME,
+        api_key=CLOUDINARY_API_KEY,
+        api_secret=CLOUDINARY_API_SECRET,
+    )
+
+os.makedirs(LOCAL_UPLOAD_DIR, exist_ok=True)
+
+# Dev performance toggle:
+# set ENABLE_STARTUP_SCRAPE=false in backend/.env to avoid heavy scraping on every restart.
+ENABLE_STARTUP_SCRAPE = os.getenv("ENABLE_STARTUP_SCRAPE", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 # Windows consoles can default to cp1252; force UTF-8 output so log emojis
 # from scraper/background jobs never crash the process.
@@ -184,6 +214,7 @@ scholarships_col  = mongo_db["scholarships"]
 internships_col   = mongo_db["internships"]
 applications_col  = mongo_db["applications"]
 notifications_col = mongo_db["notifications"]
+job_postings_col  = mongo_db["job_postings"]
 
 # Read collections
 r_users_col       = mongo_db_read["users"]
@@ -195,6 +226,7 @@ r_scholarships_col  = mongo_db_read["scholarships"]
 r_internships_col   = mongo_db_read["internships"]
 r_applications_col  = mongo_db_read["applications"]
 r_notifications_col = mongo_db_read["notifications"]
+r_job_postings_col  = mongo_db_read["job_postings"]
 
 from opportunity_scraper import persist_opportunities_from_chunks
 
@@ -248,6 +280,7 @@ def init_database_schema() -> None:
                     "liked_by": {"bsonType": "array"},
                     "comments": {"bsonType": "array"},
                     "saved_by": {"bsonType": "array"},
+                    "image_url": {"bsonType": ["string", "null"]},
                     "created_at": {"bsonType": "date"},
                     "updated_at": {"bsonType": ["date", "null"]},
                 },
@@ -443,6 +476,8 @@ def init_database_schema() -> None:
     dm_threads_col.create_index([("participants", ASCENDING), ("updated_at", DESCENDING)])
     dm_messages_col.create_index([("thread_id", ASCENDING), ("created_at", ASCENDING)])
 
+    job_postings_col.create_index([("recruiter_id", ASCENDING), ("created_at", DESCENDING)])
+
 # ═══════════════════════════════════════════════════════
 # ANTHROPIC / RAG CONFIG
 # ═══════════════════════════════════════════════════════
@@ -631,13 +666,14 @@ async def lifespan(app: FastAPI):
     global _scheduler
     init_database_schema()
     seed_dummy_content()
-    if vector_store.count() == 0:
-        # FIX: Use asyncio.to_thread (Python 3.9+) — non-blocking, no deprecated get_event_loop()
-        asyncio.create_task(asyncio.to_thread(run_scrape))
-    else:
-        n_opp = scholarships_col.count_documents({}) + internships_col.count_documents({})
-        if n_opp < 8:
-            asyncio.create_task(asyncio.to_thread(run_opportunity_scrape_only))
+    if ENABLE_STARTUP_SCRAPE:
+        if vector_store.count() == 0:
+            # FIX: Use asyncio.to_thread (Python 3.9+) — non-blocking, no deprecated get_event_loop()
+            asyncio.create_task(asyncio.to_thread(run_scrape))
+        else:
+            n_opp = scholarships_col.count_documents({}) + internships_col.count_documents({})
+            if n_opp < 8:
+                asyncio.create_task(asyncio.to_thread(run_opportunity_scrape_only))
     if _scheduler is None:
         _scheduler = BackgroundScheduler()
         _scheduler.add_job(
@@ -666,6 +702,7 @@ _raw_origins    = os.getenv(
 ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 
 app = FastAPI(title="ScholarAI API", version="5.1", lifespan=lifespan)
+app.mount("/uploads", StaticFiles(directory=LOCAL_UPLOAD_DIR), name="uploads")
 
 app.add_middleware(
     CORSMiddleware,
@@ -743,6 +780,13 @@ class SignupRequest(BaseModel):
     phone: Optional[str] = None
     linkedin_url: Optional[str] = None
     languages: List[str] = []
+    # Recruiter — LinkedIn-style professional profile (merged into user.profile)
+    recruiter_title: Optional[str] = None
+    industry: Optional[str] = None
+    company_size: Optional[str] = None
+    hiring_focus: List[str] = []
+    company_website: Optional[str] = None
+    linkedin_company_url: Optional[str] = None
 
 class LoginRequest(BaseModel):
     email: str
@@ -750,11 +794,24 @@ class LoginRequest(BaseModel):
 
 class UpdateUserRequest(BaseModel):
     name: Optional[str] = None
+    bio: Optional[str] = None
+    avatar: Optional[str] = None
     profile: Optional[dict] = None
 
 class CreatePostRequest(BaseModel):
-    text: str
+    text: Optional[str] = None
     tag: str
+    image_url: Optional[str] = None
+
+class JobPostingCreate(BaseModel):
+    title: str
+    description: str
+    employment_type: str = "Internship"
+    location_type: str = "Hybrid"
+    location: Optional[str] = None
+    apply_how: str
+    skills_keywords: List[str] = []
+    deadline: Optional[datetime] = None
 
 class CommentRequest(BaseModel):
     text: str
@@ -855,17 +912,33 @@ def _build_system_prompt(contexts: List[dict]) -> str:
         "- Mention source URLs.\n"
     )
 
+
+def _build_general_assistant_system(bot_type: str) -> str:
+    base = (
+        "You are SCHLR AI — a concise, professional advisor for scholarships, internships, CVs, and study preparation.\n"
+        "No SCHLR knowledge-base snippets matched this question.\n"
+        "Give generally sound guidance; do not invent specific program names, deadlines, acceptance rates, fees, or URLs.\n"
+        "If facts are uncertain, say so and suggest checking official sources (universities, HEC, IBCC, MOFA, embassies).\n"
+        "Use brief headings and bullets when helpful.\n"
+    )
+    prefix = BOT_SYSTEM_PROMPTS.get(bot_type)
+    if prefix:
+        return prefix + "\n\n" + base
+    return base
+
+
 def _generate_answer(
     question: str, history: List[dict], contexts: List[dict], bot_type: str = "general"
 ) -> str:
-    if not contexts:
-        return "I don't have relevant information for that question."
-    system     = _build_system_prompt(contexts)
-    bot_prefix = BOT_SYSTEM_PROMPTS.get(bot_type)
-    if bot_prefix:
-        system = bot_prefix + "\n\n" + system
     messages = [{"role": h["role"], "content": h["content"]} for h in history]
     messages.append({"role": "user", "content": question})
+    if contexts:
+        system = _build_system_prompt(contexts)
+        bot_prefix = BOT_SYSTEM_PROMPTS.get(bot_type)
+        if bot_prefix:
+            system = bot_prefix + "\n\n" + system
+    else:
+        system = _build_general_assistant_system(bot_type)
     response = claude_client.messages.create(
         model=CLAUDE_MODEL, max_tokens=1024, system=system, messages=messages,
     )
@@ -918,39 +991,55 @@ def chat(payload: ChatRequest, current_user: dict = Depends(get_current_user)):
     question = payload.question.strip()
     if not question:
         raise HTTPException(400, "Question must not be empty")
+
+    history = payload.conversation_history or []
     try:
-        history  = payload.conversation_history or []
         contexts = vector_store.query(question, top_k=TOP_K_CHUNKS)
-        answer   = _generate_answer(question, history, contexts, payload.bot_type)
-        sources  = list(dict.fromkeys(c["url"] for c in contexts))
-        user_id  = current_user["sub"]
+    except Exception:
+        contexts = []
 
-        # FIX: Use a real conversation_id — fall back to user_id only if not provided
-        conversation_id = payload.conversation_id or user_id
+    sources = list(dict.fromkeys(c["url"] for c in contexts))
+    user_id = current_user["sub"]
+    conversation_id = payload.conversation_id or user_id
+    warning: Optional[str] = None
 
-        messages_col.insert_many([
-            {
-                "user_id":         user_id,
-                "conversation_id": conversation_id,
-                "role":            "user",
-                "content":         question,
-                "timestamp":       datetime.utcnow(),
-            },
-            {
-                "user_id":         user_id,
-                "conversation_id": conversation_id,
-                "role":            "assistant",
-                "content":         answer,
-                "sources":         sources,
-                "timestamp":       datetime.utcnow(),
-            },
-        ])
+    try:
+        answer = _generate_answer(question, history, contexts, payload.bot_type)
+    except anthropic.APIError:
+        answer = (
+            "The AI assistant cannot reach Claude right now. Please try again shortly. "
+            "If your project uses ANTHROPIC_API_KEY in `backend/.env`, confirm it is active and billed."
+        )
+        sources = []
+        warning = "ai_upstream"
 
-        return {"answer": answer, "sources": sources, "bot_type": payload.bot_type}
-    except anthropic.APIError as exc:
-        raise HTTPException(502, f"AI error: {exc}")
-    except Exception as exc:
-        raise HTTPException(500, str(exc))
+    try:
+        messages_col.insert_many(
+            [
+                {
+                    "user_id": user_id,
+                    "conversation_id": conversation_id,
+                    "role": "user",
+                    "content": question,
+                    "timestamp": datetime.utcnow(),
+                },
+                {
+                    "user_id": user_id,
+                    "conversation_id": conversation_id,
+                    "role": "assistant",
+                    "content": answer,
+                    "sources": sources,
+                    "timestamp": datetime.utcnow(),
+                },
+            ]
+        )
+    except Exception:
+        pass
+
+    out: Dict = {"answer": answer, "sources": sources, "bot_type": payload.bot_type}
+    if warning:
+        out["warning"] = warning
+    return out
 
 @app.get("/chat/history")
 def chat_history(current_user: dict = Depends(get_current_user)):
@@ -981,6 +1070,210 @@ def get_news(limit: int = 20):
     ]
     return {"news": news, "total": len(news)}
 
+
+@app.get("/guides/degree-attestation")
+def get_degree_attestation_guide():
+    return degree_attestation_guide()
+
+
+@app.get("/recommendations/matches")
+def recommendations_matches(limit: int = 8, current_user: dict = Depends(get_current_user)):
+    user = r_users_col.find_one({"_id": ObjectId(current_user["sub"])})
+    if not user:
+        raise HTTPException(404, "User not found")
+    profile = user.get("profile") or {}
+    now = datetime.utcnow()
+    scholarships = list(
+        r_scholarships_col.find({"deadline": {"$gte": now}}).sort("deadline", 1).limit(80)
+    )
+    internships = list(
+        r_internships_col.find({"deadline": {"$gte": now}}).sort("deadline", 1).limit(80)
+    )
+    ranked_s = sorted(
+        scholarships,
+        key=lambda d: _score_doc_for_profile(d, profile, "scholarship"),
+        reverse=True,
+    )[: max(1, min(limit, 24))]
+    ranked_i = sorted(
+        internships,
+        key=lambda d: _score_doc_for_profile(d, profile, "internship"),
+        reverse=True,
+    )[: max(1, min(limit, 24))]
+    for lst in (ranked_s, ranked_i):
+        for d in lst:
+            d["_id"] = str(d["_id"])
+            _serialize(d)
+    return {
+        "profile_summary": {
+            "major": profile.get("major"),
+            "target_country": profile.get("target_country"),
+            "interests": profile.get("interests"),
+            "degree": profile.get("degree"),
+        },
+        "scholarships": ranked_s,
+        "internships": ranked_i,
+    }
+
+
+@app.post("/upload/image")
+async def upload_image(
+    file: UploadFile = File(...),
+    folder: str = Query("posts", description="posts or avatars"),
+    current_user: dict = Depends(get_current_user),
+):
+    vf = folder if folder in ("posts", "avatars") else "posts"
+    content = await file.read()
+    if len(content) > 8 * 1024 * 1024:
+        raise HTTPException(400, "File too large (max 8 MB)")
+    ctype = (file.content_type or "").lower()
+    allowed_types = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+    }
+    if ctype not in allowed_types:
+        raise HTTPException(400, "Only JPEG, PNG, WebP, or GIF images are allowed")
+
+    if CLOUDINARY_CONFIGURED:
+        import cloudinary.uploader
+
+        result = cloudinary.uploader.upload(
+            content,
+            folder=f"schlr/{vf}",
+            resource_type="image",
+        )
+        url = result.get("secure_url") or result.get("url")
+        if not url:
+            raise HTTPException(500, "Upload failed")
+        return {"url": url, "storage": "cloudinary"}
+
+    # Fallback for local/dev use when Cloudinary is not configured.
+    ext = allowed_types[ctype]
+    safe_folder = os.path.join(LOCAL_UPLOAD_DIR, vf)
+    os.makedirs(safe_folder, exist_ok=True)
+    filename = f"{uuid.uuid4().hex}{ext}"
+    abs_path = os.path.join(safe_folder, filename)
+    with open(abs_path, "wb") as f:
+        f.write(content)
+    url = f"{PUBLIC_BACKEND_URL}/uploads/{vf}/{filename}"
+    return {"url": url, "storage": "local"}
+
+
+@app.get("/users/search")
+def search_users(
+    q: str = "",
+    limit: int = 12,
+    current_user: dict = Depends(get_current_user),
+):
+    """Find users by name or handle to start a DM thread (directory search)."""
+    needle = (q or "").strip()
+    if len(needle) < 2:
+        return {"users": []}
+    lim = max(1, min(limit, 30))
+    me = current_user["sub"]
+    rx = re.compile(re.escape(needle), re.I)
+    cur = r_users_col.find(
+        {"_id": {"$ne": ObjectId(me)}, "$or": [{"handle": rx}, {"name": rx}]},
+        {"password": 0, "name": 1, "handle": 1, "user_type": 1, "avatar": 1},
+    ).limit(lim)
+    users_out: List[dict] = []
+    for u in cur:
+        users_out.append(
+            {
+                "id": str(u["_id"]),
+                "name": u.get("name"),
+                "handle": u.get("handle"),
+                "user_type": u.get("user_type"),
+                "avatar": u.get("avatar"),
+            }
+        )
+    return {"users": users_out}
+
+
+@app.post("/recruiter/jobs", status_code=201)
+def recruiter_create_job(data: JobPostingCreate, current_user: dict = Depends(get_current_user)):
+    uid = current_user["sub"]
+    u = r_users_col.find_one({"_id": ObjectId(uid)})
+    if not u or u.get("user_type") != "recruiter":
+        raise HTTPException(403, "Only recruiter accounts can publish roles")
+    if not data.title.strip():
+        raise HTTPException(400, "Job title is required")
+    if len((data.description or "").strip()) < 20:
+        raise HTTPException(400, "Description should be at least 20 characters")
+    prof = u.get("profile") or {}
+    doc = {
+        "recruiter_id": uid,
+        "company_name": prof.get("university") or u.get("name"),
+        "title": data.title.strip(),
+        "description": data.description.strip(),
+        "employment_type": data.employment_type.strip() or "Internship",
+        "location_type": data.location_type.strip() or "Hybrid",
+        "location": (data.location or "").strip() or None,
+        "apply_how": data.apply_how.strip(),
+        "skills_keywords": data.skills_keywords or [],
+        "deadline": data.deadline,
+        "created_at": datetime.utcnow(),
+        "updated_at": None,
+        "status": "active",
+    }
+    result = job_postings_col.insert_one(doc)
+    return {"status": "created", "job_id": str(result.inserted_id)}
+
+
+@app.get("/recruiter/jobs/me")
+def recruiter_list_jobs(current_user: dict = Depends(get_current_user)):
+    uid = current_user["sub"]
+    u = r_users_col.find_one({"_id": ObjectId(uid)})
+    if not u or u.get("user_type") != "recruiter":
+        raise HTTPException(403, "Recruiter accounts only")
+    jobs = list(r_job_postings_col.find({"recruiter_id": uid}).sort("created_at", -1))
+    for j in jobs:
+        j["_id"] = str(j["_id"])
+        _serialize(j)
+    return {"jobs": jobs}
+
+
+@app.delete("/recruiter/jobs/{job_id}")
+def recruiter_delete_job(job_id: str, current_user: dict = Depends(get_current_user)):
+    uid = current_user["sub"]
+    oid = _parse_object_id(job_id, "job_id")
+    doc = job_postings_col.find_one({"_id": oid})
+    if not doc or doc.get("recruiter_id") != uid:
+        raise HTTPException(404, "Job not found")
+    job_postings_col.delete_one({"_id": oid})
+    return {"status": "deleted"}
+
+
+@app.get("/recruiter/dashboard")
+def recruiter_dashboard(current_user: dict = Depends(get_current_user)):
+    uid = current_user["sub"]
+    u = r_users_col.find_one({"_id": ObjectId(uid)})
+    if not u or u.get("user_type") != "recruiter":
+        raise HTTPException(403, "Recruiter accounts only")
+    prof = u.get("profile") or {}
+    active_jobs = job_postings_col.count_documents({"recruiter_id": uid})
+    return {
+        "company": {
+            "display_name": prof.get("university") or u.get("name"),
+            "industry": prof.get("industry"),
+            "recruiter_title": prof.get("recruiter_title"),
+            "company_website": prof.get("company_website"),
+            "linkedin_company_url": prof.get("linkedin_company_url"),
+            "hiring_focus": prof.get("hiring_focus") or [],
+        },
+        "metrics": {
+            "active_job_postings": active_jobs,
+            "new_applicants_this_week": 0,
+            "shortlisted": 0,
+            "in_interview": 0,
+        },
+        "tips": [
+            "Clear titles and required skills improve match quality with STEM and business talent.",
+            "Share application links or a monitored careers inbox in “How to apply”.",
+        ],
+    }
+
 # ═══════════════════════════════════════════════════════
 # AUTH
 # ═══════════════════════════════════════════════════════
@@ -1000,35 +1293,58 @@ def signup(data: SignupRequest):
     if r_users_col.find_one({"email": email}):
         raise HTTPException(400, "Email already registered")
 
+    ut = data.user_type if data.user_type in ("student", "recruiter") else "student"
+    if ut == "recruiter":
+        title = (data.recruiter_title or "").strip()
+        industry = (data.industry or "").strip()
+        if len(title) < 2:
+            raise HTTPException(400, "Your role or title at the organization is required for recruiter accounts")
+        if len(industry) < 2:
+            raise HTTPException(400, "Industry is required for recruiter accounts")
+
+    profile: dict = {
+        "university": data.university,
+        "degree": data.degree,
+        "major": data.major,
+        "country": data.country,
+        "target_country": data.target_country,
+        "interests": data.interests,
+        "cgpa": data.cgpa,
+        "current_field": data.current_field,
+        "interested_fields": data.interested_fields,
+        "interested_countries": data.interested_countries,
+        "graduation_year": data.graduation_year,
+        "phone": data.phone,
+        "linkedin_url": data.linkedin_url,
+        "languages": data.languages,
+    }
+    if ut == "recruiter":
+        profile.update(
+            {
+                "recruiter_title": (data.recruiter_title or "").strip(),
+                "industry": (data.industry or "").strip(),
+                "company_size": (data.company_size or "").strip() or None,
+                "hiring_focus": data.hiring_focus or [],
+                "company_website": (data.company_website or "").strip() or None,
+                "linkedin_company_url": (data.linkedin_company_url or "").strip() or None,
+            }
+        )
+
     user = {
-        "name":      data.name,
-        "email":     email,
-        "password":  hash_password(data.password),
-        "user_type": data.user_type if data.user_type in ("student", "recruiter") else "student",
-        "handle":    email.split("@")[0],
-        "avatar":    None,
-        "bio":       None,
-        "profile": {
-            "university":           data.university,
-            "degree":               data.degree,
-            "major":                data.major,
-            "country":              data.country,
-            "target_country":       data.target_country,
-            "interests":            data.interests,
-            "cgpa":                 data.cgpa,
-            "current_field":        data.current_field,
-            "interested_fields":    data.interested_fields,
-            "interested_countries": data.interested_countries,
-            "graduation_year":      data.graduation_year,
-            "phone":                data.phone,
-            "linkedin_url":         data.linkedin_url,
-            "languages":            data.languages,
-        },
-        "followers":   [],
-        "following":   [],
+        "name": data.name,
+        "email": email,
+        "password": hash_password(data.password),
+        "user_type": ut,
+        "status": "pending" if ut == "recruiter" else "approved",
+        "handle": email.split("@")[0],
+        "avatar": None,
+        "bio": None,
+        "profile": profile,
+        "followers": [],
+        "following": [],
         "saved_posts": [],
-        "created_at":  datetime.utcnow(),
-        "updated_at":  None,
+        "created_at": datetime.utcnow(),
+        "updated_at": None,
     }
 
     result  = users_col.insert_one(user)
@@ -1059,6 +1375,11 @@ def login(data: LoginRequest):
     user = r_users_col.find_one({"email": email})
     if not user or not verify_password(data.password, user["password"]):
         raise HTTPException(401, "Invalid email or password")
+        
+    if user.get("user_type") == "recruiter" and user.get("status") == "pending":
+        raise HTTPException(403, "Account pending approval from super admin")
+    elif user.get("user_type") == "recruiter" and user.get("status") == "rejected":
+        raise HTTPException(403, "Account rejected by super admin")
 
     users_col.update_one(
         {"_id": user["_id"]},
@@ -1096,6 +1417,51 @@ def me(current_user: dict = Depends(get_current_user)):
     return user
 
 # ═══════════════════════════════════════════════════════
+# SUPER ADMIN (RECRUITER VERIFICATION)
+# ═══════════════════════════════════════════════════════
+
+@app.get("/admin/recruiters/pending")
+def admin_get_pending_recruiters(current_user: dict = Depends(get_current_user)):
+    user = r_users_col.find_one({"_id": ObjectId(current_user["sub"])})
+    if not user or user.get("user_type") != "super_admin":
+        raise HTTPException(403, "Super admin access required")
+    recruiters = list(r_users_col.find({"user_type": "recruiter", "status": "pending"}, {"password": 0}))
+    for r in recruiters:
+        r["_id"] = str(r["_id"])
+    return {"recruiters": recruiters}
+
+
+@app.post("/admin/recruiters/{recruiter_id}/approve")
+def admin_approve_recruiter(recruiter_id: str, current_user: dict = Depends(get_current_user)):
+    user = r_users_col.find_one({"_id": ObjectId(current_user["sub"])})
+    if not user or user.get("user_type") != "super_admin":
+        raise HTTPException(403, "Super admin access required")
+    
+    result = users_col.update_one(
+        {"_id": ObjectId(recruiter_id), "user_type": "recruiter"},
+        {"$set": {"status": "approved", "updated_at": datetime.utcnow()}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(404, "Recruiter not found")
+    return {"status": "approved"}
+
+
+@app.post("/admin/recruiters/{recruiter_id}/reject")
+def admin_reject_recruiter(recruiter_id: str, current_user: dict = Depends(get_current_user)):
+    user = r_users_col.find_one({"_id": ObjectId(current_user["sub"])})
+    if not user or user.get("user_type") != "super_admin":
+        raise HTTPException(403, "Super admin access required")
+    
+    result = users_col.update_one(
+        {"_id": ObjectId(recruiter_id), "user_type": "recruiter"},
+        {"$set": {"status": "rejected", "updated_at": datetime.utcnow()}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(404, "Recruiter not found")
+    return {"status": "rejected"}
+
+
+# ═══════════════════════════════════════════════════════
 # USERS
 # ═══════════════════════════════════════════════════════
 
@@ -1121,6 +1487,13 @@ def update_user(
     raw_update: dict = {"updated_at": datetime.utcnow()}
     if data.name is not None:
         raw_update["name"] = data.name
+    if data.bio is not None:
+        raw_update["bio"] = (data.bio or "")[:4000]
+    if data.avatar is not None:
+        av = (data.avatar or "").strip()
+        if av.startswith("http") and CLOUDINARY_CONFIGURED and not _allowed_image_url(av):
+            raise HTTPException(400, "Profile photo must use an image uploaded through SCHLR")
+        raw_update["avatar"] = av or None
     if data.profile is not None:
         allowed_profile_keys = {
             "university",
@@ -1140,10 +1513,17 @@ def update_user(
             "website_url",
             "skills",
             "languages",
+            "recruiter_title",
+            "industry",
+            "company_size",
+            "hiring_focus",
+            "company_website",
+            "linkedin_company_url",
         }
-        raw_update["profile"] = {
-            k: v for k, v in data.profile.items() if k in allowed_profile_keys
-        }
+        existing = users_col.find_one({"_id": ObjectId(user_id)}, {"profile": 1}) or {}
+        current_profile = existing.get("profile") or {}
+        filtered = {k: v for k, v in data.profile.items() if k in allowed_profile_keys}
+        raw_update["profile"] = {**current_profile, **filtered}
 
     safe_update = _strip_immutable(raw_update, _USER_IMMUTABLE_FIELDS)
     users_col.update_one({"_id": ObjectId(user_id)}, {"$set": safe_update})
@@ -1157,6 +1537,7 @@ def delete_user(user_id: str, current_user: dict = Depends(get_current_user)):
 
     # FIX: Cascade delete to prevent orphaned documents
     posts_col.delete_many({"user_id": user_id})
+    job_postings_col.delete_many({"recruiter_id": user_id})
     messages_col.delete_many({"user_id": user_id})
     dm_messages_col.delete_many({"sender_id": user_id})
     dm_threads_col.delete_many({"participants": user_id})
@@ -1226,6 +1607,197 @@ ALLOWED_TAGS = {
 def _normalize_tag(tag: str) -> str:
     return (tag or "").strip().lower()
 
+
+def _allowed_image_url(url: Optional[str]) -> bool:
+    if not url:
+        return True
+    url = url.strip()
+    local_prefix = f"{PUBLIC_BACKEND_URL}/uploads/"
+    if url.startswith(local_prefix):
+        return True
+    if not CLOUDINARY_CLOUD_NAME:
+        return False
+    prefix = f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/"
+    return url.startswith(prefix) or url.startswith(prefix.replace("https://", "http://"))
+
+
+def degree_attestation_guide() -> dict:
+    """
+    Educational reference for Pakistani students — official steps change frequently;
+    the UI exposes this alongside a disclaimer to verify on live portals.
+    """
+    return {
+        "title": "Degree verification & attestation — reference guide",
+        "disclaimer": (
+            "Fees, forms, timings, and required documents change frequently. Always confirm "
+            "the latest instructions on official BISE / FBISE, IBCC, MOFA, HEC, and embassy sites before "
+            "visiting offices or courier services."
+        ),
+        "sections": [
+            {
+                "id": "bise",
+                "authority": "Provincial BISE Boards",
+                "summary": (
+                    "Board of Intermediate & Secondary Education (BISE) attests secondary school certificates "
+                    "(SSC) and intermediate (HSSC) transcripts issued under that board."
+                ),
+                "steps": [
+                    "Identify the issuing board from your certificate (e.g. BISE Lahore, BISE Karachi).",
+                    "Download the relevant attestation or verification form from that board portal (if offered). Photocopies of CNIC/NICOP and original documents are routinely required.",
+                    "Pay challan fees at the prescribed bank branches and keep receipts.",
+                    "Visit the designated board facilitation counter during working hours or use an approved online application where available.",
+                    "Collect board-attested copies or verification letters as instructed; keep digital scans for IBCC equivalence.",
+                ],
+                "references": [{"label": "Find your provincial board portals", "url": "https://www.fbise.edu.pk/regional-office"}],
+            },
+            {
+                "id": "fbise",
+                "authority": "FBISE Islamabad",
+                "summary": "Federal Board transcripts and SSC/HSSC certifications attested through FBISE HQ or regional offices.",
+                "steps": [
+                    "Locate your roll number, registration year, and exam type from your FBISE credential.",
+                    "Use the FBISE learner services portal where available or visit the Headquarters / regional counter with originals and photocopies.",
+                    "Clear applicable fee challans and biometric/CNIC verification as announced on their circulars.",
+                    "Receive board-authenticated photocopies sealed per policy for onward submission to IBCC or foreign institutions.",
+                ],
+                "references": [{"label": "FBISE official site", "url": "https://www.fbise.edu.pk"}],
+            },
+            {
+                "id": "ibcc",
+                "authority": "IBCC (Inter Board Committee of Chairmen)",
+                "summary": (
+                    "IBCC verifies equivalency of SSC/HSSC credentials for study abroad embassies, foreign universities, and many employers."
+                ),
+                "steps": [
+                    "Ensure your board has already endorsed the transcripts you plan to attest.",
+                    "Complete the IBCC online pre-application (when active) selecting the embassy or institutional destination.",
+                    "Upload crisp scans — CNIC/NICOP, latest photographs, transcripts, syllabus comparison if requested.",
+                    "Pay online or bank challans as instructed; courier documents if biometric capture is waived.",
+                    "Track application status electronically; IBCC issues Equivalence / Verification certificates you then pass to MOFA or HEC as required.",
+                ],
+                "references": [{"label": "IBCC portal", "url": "https://www.ibcc.edu.pk"}],
+            },
+            {
+                "id": "mofa",
+                "authority": "Ministry of Foreign Affairs (MOFA)",
+                "summary": "MOFA legalises public documents for use outside Pakistan after prior educational authentication.",
+                "steps": [
+                    "Sequence matters: complete board/IBCC/HEC steps before MOFA unless the destination embassy states otherwise.",
+                    "Book an e-ticket via the MOFA Consular Services portal for the correct category (educational).",
+                    "Bring original credentials plus IBCC cover letter; MOFA attaches apostille-equivalent stamping for select countries.",
+                    "Pay consular charges at designated banks; biometric verification may occur at the facilitation centre.",
+                    "Forward MOFA-attested packs to embassies for student visa stamping if required.",
+                ],
+                "references": [{"label": "MOFA consular automation", "url": "https://mofa.gov.pk"}],
+            },
+            {
+                "id": "hec",
+                "authority": "Higher Education Commission (HEC)",
+                "summary": (
+                    "HEC verifies bachelor, master, or PhD degrees issued by chartered Pakistani universities for employment, admissions, "
+                    "and scholarships."
+                ),
+                "steps": [
+                    "Create/update your account on HEC's degree verification portal (Digi transcript / attestation workflows change over time — follow whichever module is publicly active).",
+                    "Upload registrar-sealed transcripts, provisional certificate, CNIC/NICOP, and purpose letter (employment, admissions, embassy).",
+                    "Pay service fees digitally; courier hard copies only if instructed by HEC ticketing support.",
+                    "Track ticket status until HEC mails or emails you the verification letter or digital seal.",
+                    "Couple HEC attestations with MOFA when foreign authorities request full-chain authentication.",
+                ],
+                "references": [{"label": "HEC homepage", "url": "https://www.hec.gov.pk"}],
+            },
+            {
+                "id": "timeline",
+                "authority": "Practical sequencing",
+                "summary": (
+                    "A typical outbound study route: Board → IBCC equivalence → MOFA → Embassy. "
+                    "Job seekers often need HEC verification before HR overseas accepts Pakistani degrees."
+                ),
+                "steps": [
+                    "Start 10–14 weeks ahead of embassy interviews or HR deadlines.",
+                    "Maintain a certified-scan folder colour-coded per authority.",
+                    "Use registered couriers between cities; duplicate attested sets for redundancy.",
+                    "Keep translation certificates ready if programmes require sworn translations.",
+                ],
+                "references": [],
+            },
+        ],
+    }
+
+
+def _split_countries(raw: Optional[str]) -> List[str]:
+    if not raw:
+        return []
+    return [p.strip().lower() for p in re.split(r"[,;/|]+", raw) if p.strip()]
+
+
+def _interest_to_scholarship_types(interests: List[str]) -> List[str]:
+    blob = (" ".join(interests)).lower()
+    mapped: List[str] = []
+    if "fully" in blob or "funded" in blob:
+        mapped.append("funded")
+    if "merit" in blob:
+        mapped.append("merit")
+    if "need" in blob:
+        mapped.append("need")
+    if "phd" in blob:
+        mapped.append("phd")
+    return list(dict.fromkeys(mapped)) or ["funded", "merit", "need", "phd"]
+
+
+def _score_doc_for_profile(doc: dict, profile: dict, kind: str) -> int:
+    score = 0
+    majors = (profile.get("major") or "").lower()
+    countries = _split_countries(profile.get("target_country") or "")
+    interests = profile.get("interests") or []
+
+    if kind == "scholarship":
+        hay = (
+            (doc.get("title") or "")
+            + " "
+            + (doc.get("eligibility") or "")
+            + " "
+            + (doc.get("country") or "")
+        ).lower()
+        ctype = doc.get("type")
+        for t in _interest_to_scholarship_types(interests):
+            if ctype == t:
+                score += 3
+        ctry = (doc.get("country") or "").lower()
+        for co in countries:
+            if co and co in ctry:
+                score += 4
+        for word in majors.split():
+            if len(word) > 3 and word in hay:
+                score += 2
+        for i in interests:
+            il = i.lower()
+            if len(il) > 2 and il in hay:
+                score += 1
+    else:
+        hay = (
+            (doc.get("title") or "")
+            + " "
+            + (doc.get("field") or "")
+            + " "
+            + (doc.get("company") or "")
+        ).lower()
+        for word in majors.split():
+            if len(word) > 3 and word in hay:
+                score += 4
+        for i in interests:
+            il = i.lower()
+            if "intern" in il:
+                score += 2
+            if len(il) > 2 and il in hay:
+                score += 1
+        loc = (doc.get("location") or "").lower()
+        for co in countries:
+            if co and co in loc:
+                score += 2
+    return score
+
+
 @app.post("/posts", status_code=201)
 def create_post(data: CreatePostRequest, current_user: dict = Depends(get_current_user)):
     normalized_tag = _normalize_tag(data.tag)
@@ -1239,20 +1811,30 @@ def create_post(data: CreatePostRequest, current_user: dict = Depends(get_curren
     if not user:
         raise HTTPException(404, "User not found")
 
+    img = (data.image_url or "").strip() or None
+    if img:
+        if not _allowed_image_url(img):
+            raise HTTPException(400, "Image URL must come from SCHLR upload endpoint.")
+
+    text_value = (data.text or "").strip()
+    if not text_value and not img:
+        raise HTTPException(400, "Post must include text or an image.")
+
     post = {
-        "user_id":     user_id,
-        "user_name":   user["name"],
+        "user_id": user_id,
+        "user_name": user["name"],
         "user_handle": user.get("handle", ""),
-        "user_type":   user.get("user_type", "student"),
+        "user_type": user.get("user_type", "student"),
         "user_avatar": user.get("avatar"),
-        "text":        data.text,
-        "tag":         data.tag.strip(),
-        "likes":       0,
-        "liked_by":    [],
-        "comments":    [],
-        "saved_by":    [],
-        "created_at":  datetime.utcnow(),
-        "updated_at":  None,
+        "text": text_value,
+        "tag": data.tag.strip(),
+        "image_url": img,
+        "likes": 0,
+        "liked_by": [],
+        "comments": [],
+        "saved_by": [],
+        "created_at": datetime.utcnow(),
+        "updated_at": None,
     }
 
     result = posts_col.insert_one(post)
@@ -1300,10 +1882,22 @@ def update_post(
     if post["user_id"] != current_user["sub"]:
         raise HTTPException(403, "Cannot edit another user's post")
 
-    posts_col.update_one(
-        {"_id": ObjectId(post_id)},
-        {"$set": {"text": data.text, "tag": data.tag.strip(), "updated_at": datetime.utcnow()}},
-    )
+    img = (data.image_url or "").strip() or None
+    if img:
+        if not _allowed_image_url(img):
+            raise HTTPException(400, "Image URL must come from SCHLR upload endpoint.")
+
+    text_value = (data.text or "").strip()
+    if not text_value and not img:
+        raise HTTPException(400, "Post must include text or an image.")
+
+    set_doc = {
+        "text": text_value,
+        "tag": data.tag.strip(),
+        "updated_at": datetime.utcnow(),
+        "image_url": img,
+    }
+    posts_col.update_one({"_id": ObjectId(post_id)}, {"$set": set_doc})
     return {"status": "updated"}
 
 
@@ -1765,7 +2359,8 @@ def get_dm_threads(current_user: dict = Depends(get_current_user)):
         other_id = next((p for p in t["participants"] if p != user_id), None)
         if other_id:
             other = r_users_col.find_one(
-                {"_id": ObjectId(other_id)}, {"name": 1, "handle": 1, "avatar": 1}
+                {"_id": ObjectId(other_id)},
+                {"name": 1, "handle": 1, "avatar": 1, "user_type": 1},
             )
             t["other_user"] = _serialize(other) if other else None
     return threads
