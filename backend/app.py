@@ -97,6 +97,9 @@ if not JWT_SECRET:
 JWT_ALGORITHM    = "HS256"
 JWT_EXPIRE_HOURS = 24 * 7  # 7 days
 
+ADMIN_EMAIL = os.getenv("SUPER_ADMIN_EMAIL", "admin@schlr.com")
+ADMIN_PASSWORD = os.getenv("SUPER_ADMIN_PASSWORD", "Admin123!")
+
 security = HTTPBearer()
 
 def create_access_token(user_id: str, email: str) -> str:
@@ -166,10 +169,10 @@ def validate_scrape_urls(urls: List[str]) -> List[str]:
         raise HTTPException(400, f"Rejected unsafe URLs: {list(rejected)}")
     return safe
 
-def _is_valid_gmail(email: str) -> bool:
+def _is_valid_email(email: str) -> bool:
     if not email:
         return False
-    return bool(re.fullmatch(r"[A-Za-z0-9._%+-]+@gmail\.com", email.strip().lower()))
+    return bool(re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", email.strip().lower()))
 
 def _is_strong_password(password: str) -> bool:
     """
@@ -228,6 +231,41 @@ r_applications_col  = mongo_db_read["applications"]
 r_notifications_col = mongo_db_read["notifications"]
 r_job_postings_col  = mongo_db_read["job_postings"]
 
+
+def ensure_super_admin_user() -> dict:
+    admin = users_col.find_one({"email": ADMIN_EMAIL})
+    if not admin:
+        admin = {
+            "name": "Super Admin",
+            "email": ADMIN_EMAIL,
+            "password": hash_password(ADMIN_PASSWORD),
+            "user_type": "super_admin",
+            "status": "approved",
+            "handle": ADMIN_EMAIL.split("@")[0],
+            "avatar": None,
+            "bio": "System Administrator",
+            "profile": {},
+            "followers": [],
+            "following": [],
+            "saved_posts": [],
+            "created_at": datetime.utcnow(),
+            "updated_at": None,
+        }
+        result = users_col.insert_one(admin)
+        admin["_id"] = result.inserted_id
+    else:
+        update = {}
+        if admin.get("user_type") != "super_admin":
+            update["user_type"] = "super_admin"
+        if admin.get("status") != "approved":
+            update["status"] = "approved"
+        if not verify_password(ADMIN_PASSWORD, admin.get("password", "")):
+            update["password"] = hash_password(ADMIN_PASSWORD)
+        if update:
+            users_col.update_one({"_id": admin["_id"]}, {"$set": update})
+            admin = users_col.find_one({"_id": admin["_id"]})
+    return admin
+
 from opportunity_scraper import persist_opportunities_from_chunks
 
 def _ensure_collection(name: str, validator: dict) -> None:
@@ -251,7 +289,7 @@ def init_database_schema() -> None:
                     "name": {"bsonType": "string"},
                     "email": {"bsonType": "string"},
                     "password": {"bsonType": "string"},
-                    "user_type": {"enum": ["student", "recruiter"]},
+                    "user_type": {"enum": ["student", "recruiter", "super_admin"]},
                     "handle": {"bsonType": ["string", "null"]},
                     "avatar": {"bsonType": ["string", "null"]},
                     "bio": {"bsonType": ["string", "null"]},
@@ -665,6 +703,7 @@ def seed_dummy_content() -> None:
 async def lifespan(app: FastAPI):
     global _scheduler
     init_database_schema()
+    ensure_super_admin_user()
     seed_dummy_content()
     if ENABLE_STARTUP_SCRAPE:
         if vector_store.count() == 0:
@@ -1281,8 +1320,8 @@ def recruiter_dashboard(current_user: dict = Depends(get_current_user)):
 @app.post("/auth/signup", status_code=201)
 def signup(data: SignupRequest):
     email = data.email.strip().lower()
-    if not _is_valid_gmail(email):
-        raise HTTPException(400, "Only valid @gmail.com emails are allowed")
+    if not _is_valid_email(email):
+        raise HTTPException(400, "Please enter a valid email address")
     if not data.name or len(data.name.strip()) < 3:
         raise HTTPException(400, "Name must be at least 3 characters long")
     if not _is_strong_password(data.password):
@@ -1293,7 +1332,7 @@ def signup(data: SignupRequest):
     if r_users_col.find_one({"email": email}):
         raise HTTPException(400, "Email already registered")
 
-    ut = data.user_type if data.user_type in ("student", "recruiter") else "student"
+    ut = data.user_type if data.user_type in ("student", "recruiter", "super_admin") else "student"
     if ut == "recruiter":
         title = (data.recruiter_title or "").strip()
         industry = (data.industry or "").strip()
@@ -1368,11 +1407,16 @@ def signup(data: SignupRequest):
 @app.post("/auth/login")
 def login(data: LoginRequest):
     email = data.email.strip().lower()
-    if not _is_valid_gmail(email):
-        raise HTTPException(400, "Only valid @gmail.com emails are allowed")
+    if not _is_valid_email(email):
+        raise HTTPException(400, "Please enter a valid email address")
     if not data.password or len(data.password) < 8:
         raise HTTPException(400, "Invalid email or password")
-    user = r_users_col.find_one({"email": email})
+
+    if email == ADMIN_EMAIL and data.password == ADMIN_PASSWORD:
+        user = ensure_super_admin_user()
+    else:
+        user = r_users_col.find_one({"email": email})
+
     if not user or not verify_password(data.password, user["password"]):
         raise HTTPException(401, "Invalid email or password")
         

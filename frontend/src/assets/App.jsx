@@ -344,10 +344,10 @@ function AuthPage({ onLogin, onAuthToken, initialMode = "login", onBack }) {
   const handleSubmit = async () => {
     setError("");
     const normalizedEmail = form.email.trim().toLowerCase();
-    const gmailRegex = /^[A-Za-z0-9._%+-]+@gmail\.com$/;
+    const emailRegex = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
     const strongPassRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,}$/;
-    if (!gmailRegex.test(normalizedEmail)) {
-      setError("Only valid @gmail.com emails are allowed.");
+    if (!emailRegex.test(normalizedEmail)) {
+      setError("Please enter a valid email address.");
       return;
     }
     if (!form.email.trim() || !form.password.trim()) {
